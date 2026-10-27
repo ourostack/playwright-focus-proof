@@ -128,7 +128,7 @@ jobs:
           - name: PR 3 extension tests
             branch: user/arimendelow/no-focus-3-extension-connect
             spec: tests/extension/connect-in-background.spec.ts
-            before: c409f8c83ec04485e829809beceb722d9cf8ff38:packages/extension c1b1d54c3ef91b1f1fdf73acd9128e9a0f34136d:packages/extension
+            before: c409f8c83ec04485e829809beceb722d9cf8ff38:packages/extension c1b1d54c3ef91b1f1fdf73acd9128e9a0f34136d:packages/extension 4bc99fc394c50470eeebc7064ed4f16bf977c8f1:packages/extension
     runs-on: macos-latest
     timeout-minutes: 90
     env:
