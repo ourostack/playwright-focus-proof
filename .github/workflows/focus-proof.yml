@@ -1,0 +1,172 @@
+# Proves on GitHub's runners, never on a person's machine, that Playwright's MCP
+# tool and browser extension work in a visible browser without taking focus:
+# upstream main (before) against the proposed changes (after), each pull
+# request's extension tests, and the new tests failing on the code before.
+# The branches under test live in ourostack/playwright; GitHub paused Actions
+# on that fork, so the proof runs here.
+name: focus proof
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: focus-proof-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FORCE_COLOR: 1
+  UPSTREAM_SHA: c409f8c83ec04485e829809beceb722d9cf8ff38
+  BRANCH_REPO: ourostack/playwright
+  COMBINED_BRANCH: user/arimendelow/no-focus
+
+jobs:
+  # One run per browser and OS that the pull requests report.
+  proof:
+    name: proof ${{ matrix.os }} ${{ matrix.browser }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, browser: chromium, scenarios: other-app browser-front }
+          - { os: macos-latest, browser: msedge, scenarios: browser-front }
+          - { os: windows-latest, browser: msedge, scenarios: other-app browser-front }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        path: tools
+    - uses: actions/checkout@v4
+      with:
+        repository: ${{ env.BRANCH_REPO }}
+        ref: ${{ env.COMBINED_BRANCH }}
+        path: after
+    - uses: actions/checkout@v4
+      with:
+        repository: microsoft/playwright
+        ref: ${{ env.UPSTREAM_SHA }}
+        path: before
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+    - name: Build upstream main and the proposed changes
+      run: |
+        echo "after: $(git -C after rev-parse HEAD), before: $(git -C before rev-parse HEAD)" | tee heads.txt
+        (cd before && npm ci && npm run build)
+        (cd after && npm ci && npm run build)
+    - name: Pick the browser
+      run: |
+        mkdir -p out && mv heads.txt out/
+        case "${{ matrix.browser }}-${{ runner.os }}" in
+          chromium-*) (cd after && npx playwright install chromium); exe=$(cd after && node -e "console.log(require('./packages/playwright-core').chromium.executablePath())") ;;
+          msedge-macOS) exe="/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" ;;
+          msedge-Windows) exe="C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe" ;;
+        esac
+        echo "BROWSER_EXE=$exe" >> "$GITHUB_ENV"
+        echo "Browser: $exe"
+    - name: Screen capture permission (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        swiftc -O tools/proof/focus-sampler.swift -o "$RUNNER_TEMP/focus-sampler"
+        "$RUNNER_TEMP/focus-sampler" --preflight | tee out/screen-capture-permission.txt
+    - name: Focus proof
+      continue-on-error: true
+      timeout-minutes: 45
+      run: |
+        run() {
+          label="$1-${{ runner.os }}-${{ matrix.browser }}-$2"
+          node tools/proof/focus-proof.mjs --playwright "$1" --browser "$BROWSER_EXE" \
+            --label "$label" --scenario "$2" --rounds 2 --out "out/proof/$label" 2>&1 | tee "out/proof-$label.log" || true
+        }
+        for scenario in ${{ matrix.scenarios }}; do
+          run before $scenario
+          run after $scenario
+        done
+    - name: Connect page hand-back timing
+      continue-on-error: true
+      timeout-minutes: 15
+      run: |
+        mkdir -p out/connect-restore
+        node tools/proof/experiments/connect-restore.mjs after "$BROWSER_EXE" \
+          "out/connect-restore/${{ runner.os }}-${{ matrix.browser }}.json" 40 2>&1 | tee "out/connect-restore/${{ runner.os }}-${{ matrix.browser }}.log" || true
+    - name: Summary
+      if: always()
+      run: |
+        for f in out/proof/*/result.md; do [ -f "$f" ] && { cat "$f"; echo; } >> "$GITHUB_STEP_SUMMARY"; done; true
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: proof-${{ runner.os }}-${{ matrix.browser }}
+        path: out
+
+  # Each upstream pull request branch on its own, with upstream's extension
+  # test setup (macOS, as upstream's extension workflow runs). Then the new
+  # tests with the pull request's source files taken from before the change;
+  # they should fail.
+  pull-request:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: PR 1 extension tests
+            branch: user/arimendelow/no-focus-1-background-tabs
+            spec: tests/extension/background-tabs.spec.ts
+            before: c409f8c83ec04485e829809beceb722d9cf8ff38:packages/playwright-core/src/tools/mcp/browserModel.ts
+          - name: PR 2 extension tests
+            branch: user/arimendelow/no-focus-2-no-activate
+            spec: tests/extension/no-activate.spec.ts
+            before: c409f8c83ec04485e829809beceb722d9cf8ff38:packages/playwright-core/src/tools/backend/context.ts
+          - name: PR 3 extension tests
+            branch: user/arimendelow/no-focus-3-extension-connect
+            spec: tests/extension/connect-in-background.spec.ts
+            before: c409f8c83ec04485e829809beceb722d9cf8ff38:packages/extension c1b1d54c3ef91b1f1fdf73acd9128e9a0f34136d:packages/extension
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      DEBUG: pw:mcp:error
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        repository: ${{ env.BRANCH_REPO }}
+        ref: ${{ matrix.branch }}
+        fetch-depth: 0
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+    - run: |
+        mkdir -p "$RUNNER_TEMP/out"
+        git rev-parse HEAD | tee "$RUNNER_TEMP/out/head.txt"
+    - run: npm ci
+    - run: npm run build
+    - run: npx playwright install --with-deps chromium
+    - name: Extension tests on the branch
+      run: |
+        set -o pipefail
+        npm run test-extension 2>&1 | tee "$RUNNER_TEMP/out/extension-tests.log"
+    - name: New tests on the code before
+      if: always()
+      run: |
+        for entry in ${{ matrix.before }}; do
+          from="${entry%%:*}"; files="${entry#*:}"; short="${from:0:9}"
+          git fetch --no-tags origin "$from" 2>/dev/null || true
+          git checkout "$from" -- $files
+          git status --short
+          npm run build > "$RUNNER_TEMP/out/build-before-$short.log" 2>&1
+          npx playwright test --config=tests/extension/playwright.config.ts --retries=0 ${{ matrix.spec }} 2>&1 | tee "$RUNNER_TEMP/out/red-before-$short.log" || true
+          { echo "### ${{ matrix.spec }} with $files from $short"; echo '```'; grep -E '^\s+[0-9]+ (passed|failed|flaky|skipped)|✘' "$RUNNER_TEMP/out/red-before-$short.log" || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          git checkout HEAD -- $files
+        done
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: ${{ matrix.name }}
+        path: ${{ runner.temp }}/out
